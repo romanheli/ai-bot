@@ -49,6 +49,16 @@ class WeeklyResetTest(unittest.TestCase):
         self.check(datetime(2026, 9, 27, 2, 0, tzinfo=msk), datetime(2026, 9, 27, tzinfo=timezone.utc))
 
 
+class WeeklyTextTest(unittest.TestCase):
+    def test_moscow_time(self):
+        # вс 00:00 UTC = вс 03:00 МСК
+        self.assertEqual(bot.weekly_text(datetime(2026, 9, 27, tzinfo=timezone.utc)),
+                         "Недельный лимит Claude сбросился: 27.09.2026 03:00 МСК")
+
+    def test_padding(self):
+        self.assertEqual(bot.fmt_msk(datetime(2026, 1, 4, 21, 5, tzinfo=timezone.utc)), "05.01.2026 00:05")
+
+
 class ParseIdsTest(unittest.TestCase):
     def test_mixed_separators(self):
         self.assertEqual(bot.parse_ids("123, 456 789"), {123, 456, 789})

@@ -38,7 +38,7 @@ EMPTY_TEXT = "Сессия уже пуста."
 ONLY_TEXT = "Пока понимаю только текст."
 LOG_ANSWER = 300  # сколько символов ответа показывать в логе
 DELETE_BATCH = 100  # больше id за раз delete_messages не принимает
-WEEKLY_TEXT = "Недельный лимит Claude сбросился."
+MSK = timezone(timedelta(hours=3))  # в Москве нет перехода на летнее время
 
 
 def menu_text(creator_name, creator_url):
@@ -115,15 +115,25 @@ def next_weekly_reset(now):
     return midnight + timedelta(days=(6 - midnight.weekday()) % 7 or 7)
 
 
+def fmt_msk(moment):
+    """Время по Москве: 27.09.2026 03:00."""
+    return moment.astimezone(MSK).strftime("%d.%m.%Y %H:%M")
+
+
+def weekly_text(reset):
+    return f"Недельный лимит Claude сбросился: {fmt_msk(reset)} МСК"
+
+
 async def weekly_loop(log_bot, admin_id):
     """Раз в неделю лог-бот сообщает о сбросе лимита Claude."""
     # упрощение: если сервер лежал в момент сброса, сообщение за эту неделю не придёт
     while True:
         now = datetime.now(timezone.utc)
+        reset = next_weekly_reset(now)
         # +5 с — проснуться точно после сброса, иначе при ранней побудке пришло бы дважды
-        await asyncio.sleep((next_weekly_reset(now) - now).total_seconds() + 5)
+        await asyncio.sleep((reset - now).total_seconds() + 5)
         try:
-            await log_bot.send_message(admin_id, WEEKLY_TEXT)
+            await log_bot.send_message(admin_id, weekly_text(reset))
         except TelegramAPIError as error:
             logging.warning("Лог-бот не смог сообщить о сбросе лимита: %s", error)
 
