@@ -38,6 +38,8 @@ EMPTY_TEXT = "Сессия уже пуста."
 ONLY_TEXT = "Пока понимаю только текст."
 LOG_ANSWER = 300  # сколько символов ответа показывать в логе
 DELETE_BATCH = 100  # больше id за раз delete_messages не принимает
+STOPPED_TEXT = "Бот остановлен: остановка или перезагрузка сервера."
+CRASH_NOTE = "Прошлый запуск оборвался без остановки: процесс убили или сервер упал."
 MSK = timezone(timedelta(hours=3))  # в Москве нет перехода на летнее время
 
 
@@ -132,10 +134,39 @@ async def weekly_loop(log_bot, admin_id):
         reset = next_weekly_reset(now)
         # +5 с — проснуться точно после сброса, иначе при ранней побудке пришло бы дважды
         await asyncio.sleep((reset - now).total_seconds() + 5)
-        try:
-            await log_bot.send_message(admin_id, weekly_text(reset))
-        except TelegramAPIError as error:
-            logging.warning("Лог-бот не смог сообщить о сбросе лимита: %s", error)
+        await tell(log_bot, admin_id, weekly_text(reset))
+
+
+async def tell(log_bot, admin_id, text):
+    """Сообщение владельцу через лог-бота; не дошло — только предупреждение в консоль."""
+    try:
+        await log_bot.send_message(admin_id, text)
+    except TelegramAPIError as error:
+        logging.warning("Лог-бот не смог написать (%s) — напиши ему /start", error)
+
+
+async def serve(poll, log_bot, admin_id, models, marker):
+    """Запускает poll() и сообщает о запуске, штатной остановке и падении.
+
+    marker — файл-метка «бот работает». Остался с прошлого запуска — значит, тот оборвался так,
+    что сообщить было некому (процесс убили, сервер упал): говорим об этом при запуске."""
+    text = f"Бот запущен. Модели: {', '.join(models)}"
+    if os.path.exists(marker):
+        text += "\n" + CRASH_NOTE
+    await tell(log_bot, admin_id, text)
+    with open(marker, "w"):
+        pass
+    try:
+        await poll()
+    except Exception as error:
+        await tell(log_bot, admin_id, f"Бот упал: {type(error).__name__}: {error}")
+        raise
+    else:
+        # Stop/Restart на хостинге присылает сигнал — aiogram штатно завершает polling
+        await tell(log_bot, admin_id, STOPPED_TEXT)
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(marker)
 
 
 async def delete(bot, chat_id, ids):
@@ -264,7 +295,8 @@ def build_dispatcher(allowed, admin_id, log_bot, ask, creator_name, creator_url)
 
 async def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    load_env(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+    here = os.path.dirname(os.path.abspath(__file__))
+    load_env(os.path.join(here, ".env"))
     names = ("BOT_TOKEN", "LOG_BOT_TOKEN", "ADMIN_ID", "GEMINI_API_KEY", "CREATOR_USERNAME")
     missing = [name for name in names if not os.environ.get(name)]
     if missing:
@@ -281,13 +313,10 @@ async def main():
 
     async with aiohttp.ClientSession() as session, \
             Bot(os.environ["BOT_TOKEN"]) as tg, Bot(os.environ["LOG_BOT_TOKEN"]) as log_bot:
-        try:
-            await log_bot.send_message(admin_id, f"Бот запущен. Модели: {', '.join(models)}")
-        except TelegramAPIError as error:
-            logging.warning("Лог-бот не может написать тебе (%s) — напиши ему /start", error)
         weekly = asyncio.create_task(weekly_loop(log_bot, admin_id))  # ссылку держим, иначе задачу соберёт GC
         ask = functools.partial(ai.ask, session, os.environ["GEMINI_API_KEY"], models)
-        await build_dispatcher(allowed, admin_id, log_bot, ask, creator_name, creator_url).start_polling(tg)
+        dp = build_dispatcher(allowed, admin_id, log_bot, ask, creator_name, creator_url)
+        await serve(lambda: dp.start_polling(tg), log_bot, admin_id, models, os.path.join(here, ".running"))
 
 
 if __name__ == "__main__":

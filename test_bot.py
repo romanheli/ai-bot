@@ -1,4 +1,6 @@
 import asyncio
+import os
+import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 
@@ -73,6 +75,62 @@ class ParseIdsTest(unittest.TestCase):
     def test_bad(self):
         with self.assertRaises(SystemExit):
             bot.parse_ids("12a")
+
+
+class ServeTest(unittest.IsolatedAsyncioTestCase):
+    """serve: сообщения лог-бота о запуске, остановке и падении + файл-метка «бот работает»."""
+
+    async def asyncSetUp(self):
+        self.log_session = MockedSession()
+        self.log_bot = Bot("43:TEST", session=self.log_session)
+        self.dir = tempfile.TemporaryDirectory()
+        self.marker = os.path.join(self.dir.name, ".running")
+        self.marker_during_poll = None
+
+    async def asyncTearDown(self):
+        self.dir.cleanup()
+
+    def logs(self):
+        return [m.text for m in self.log_session.requests if isinstance(m, SendMessage) and m.chat_id == ADMIN]
+
+    async def poll(self):
+        self.marker_during_poll = os.path.exists(self.marker)
+
+    async def serve(self, poll=None):
+        await bot.serve(poll or self.poll, self.log_bot, ADMIN, ["m1", "m2"], self.marker)
+
+    async def test_clean_stop(self):
+        await self.serve()
+        logs = self.logs()
+        self.assertEqual(len(logs), 2)
+        self.assertIn("Бот запущен", logs[0])
+        self.assertIn("m1, m2", logs[0])
+        self.assertNotIn(bot.CRASH_NOTE, logs[0])
+        self.assertEqual(logs[1], bot.STOPPED_TEXT)
+        # пока работает — метка есть, после штатной остановки — нет
+        self.assertTrue(self.marker_during_poll)
+        self.assertFalse(os.path.exists(self.marker))
+
+    async def test_crash(self):
+        async def boom():
+            raise RuntimeError("всё сломалось")
+
+        with self.assertRaises(RuntimeError):
+            await self.serve(boom)
+        self.assertEqual(self.logs()[-1], "Бот упал: RuntimeError: всё сломалось")
+        self.assertNotIn(bot.STOPPED_TEXT, self.logs())
+        # о падении уже сообщили — следующий запуск не должен сообщать ещё раз
+        self.assertFalse(os.path.exists(self.marker))
+
+    async def test_killed_last_time(self):
+        open(self.marker, "w").close()  # прошлый запуск не убрал метку — его убили
+        await self.serve()
+        self.assertIn(bot.CRASH_NOTE, self.logs()[0])
+
+    async def test_log_bot_broken(self):
+        self.log_session.fail = True
+        await self.serve()  # исключение не должно вылететь
+        self.assertTrue(self.marker_during_poll)
 
 
 class BotCase(unittest.IsolatedAsyncioTestCase):
