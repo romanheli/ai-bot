@@ -8,6 +8,7 @@ import os
 import re
 import time
 from collections import deque
+from datetime import datetime, timedelta, timezone
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F
@@ -37,6 +38,7 @@ EMPTY_TEXT = "Сессия уже пуста."
 ONLY_TEXT = "Пока понимаю только текст."
 LOG_ANSWER = 300  # сколько символов ответа показывать в логе
 DELETE_BATCH = 100  # больше id за раз delete_messages не принимает
+WEEKLY_TEXT = "Недельный лимит Claude сбросился."
 
 
 def menu_text(creator_name, creator_url):
@@ -105,6 +107,25 @@ async def typing(bot, chat_id):
         yield
     finally:
         task.cancel()
+
+
+def next_weekly_reset(now):
+    """Ближайший сброс недельного лимита Claude (воскресенье 00:00 UTC) строго после now."""
+    midnight = now.astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    return midnight + timedelta(days=(6 - midnight.weekday()) % 7 or 7)
+
+
+async def weekly_loop(log_bot, admin_id):
+    """Раз в неделю лог-бот сообщает о сбросе лимита Claude."""
+    # упрощение: если сервер лежал в момент сброса, сообщение за эту неделю не придёт
+    while True:
+        now = datetime.now(timezone.utc)
+        # +5 с — проснуться точно после сброса, иначе при ранней побудке пришло бы дважды
+        await asyncio.sleep((next_weekly_reset(now) - now).total_seconds() + 5)
+        try:
+            await log_bot.send_message(admin_id, WEEKLY_TEXT)
+        except TelegramAPIError as error:
+            logging.warning("Лог-бот не смог сообщить о сбросе лимита: %s", error)
 
 
 async def delete(bot, chat_id, ids):
@@ -254,6 +275,7 @@ async def main():
             await log_bot.send_message(admin_id, f"Бот запущен. Модели: {', '.join(models)}")
         except TelegramAPIError as error:
             logging.warning("Лог-бот не может написать тебе (%s) — напиши ему /start", error)
+        weekly = asyncio.create_task(weekly_loop(log_bot, admin_id))  # ссылку держим, иначе задачу соберёт GC
         ask = functools.partial(ai.ask, session, os.environ["GEMINI_API_KEY"], models)
         await build_dispatcher(allowed, admin_id, log_bot, ask, creator_name, creator_url).start_polling(tg)
 

@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot
 from aiogram.methods import AnswerCallbackQuery, DeleteMessage, DeleteMessages, SendChatAction, SendMessage
@@ -24,6 +25,28 @@ class MenuTextTest(unittest.TestCase):
 
     def test_escape(self):
         self.assertIn("&lt;A&amp;B&gt;", bot.menu_text("<A&B>", URL))
+
+
+class WeeklyResetTest(unittest.TestCase):
+    def check(self, now, expected):
+        self.assertEqual(bot.next_weekly_reset(now), expected)
+
+    def test_midweek(self):
+        # среда -> ближайшее воскресенье 00:00 UTC
+        self.check(datetime(2026, 9, 23, 15, 30, tzinfo=timezone.utc), datetime(2026, 9, 27, tzinfo=timezone.utc))
+
+    def test_saturday_night(self):
+        self.check(datetime(2026, 9, 26, 23, 59, tzinfo=timezone.utc), datetime(2026, 9, 27, tzinfo=timezone.utc))
+
+    def test_sunday_after_reset(self):
+        # сброс уже был сегодня — следующий через неделю
+        self.check(datetime(2026, 9, 27, 0, 0, tzinfo=timezone.utc), datetime(2026, 10, 4, tzinfo=timezone.utc))
+        self.check(datetime(2026, 9, 27, 12, 0, tzinfo=timezone.utc), datetime(2026, 10, 4, tzinfo=timezone.utc))
+
+    def test_other_timezone(self):
+        # вс 02:00 по Москве = сб 23:00 UTC — сброс ещё впереди
+        msk = timezone(timedelta(hours=3))
+        self.check(datetime(2026, 9, 27, 2, 0, tzinfo=msk), datetime(2026, 9, 27, tzinfo=timezone.utc))
 
 
 class ParseIdsTest(unittest.TestCase):
