@@ -61,6 +61,17 @@ class WeeklyTextTest(unittest.TestCase):
         self.assertEqual(bot.fmt_msk(datetime(2026, 1, 4, 21, 5, tzinfo=timezone.utc)), "05.01.2026 00:05")
 
 
+class BannerTest(unittest.TestCase):
+    def test_banner(self):
+        text = bot.banner(["m1", "m2"], datetime(2026, 9, 27, 11, 5, tzinfo=timezone.utc))
+        self.assertIn("EPSILON ЗАПУЩЕН", text)
+        self.assertIn("27.09.2026 14:05 МСК", text)
+        self.assertIn("m1, m2", text)
+        # цветной: зелёный в начале, сброс цвета в конце
+        self.assertTrue(text.startswith("\033[1;92m"))
+        self.assertTrue(text.endswith("\033[0m"))
+
+
 class ParseIdsTest(unittest.TestCase):
     def test_mixed_separators(self):
         self.assertEqual(bot.parse_ids("123, 456 789"), {123, 456, 789})

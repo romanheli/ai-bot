@@ -137,6 +137,15 @@ async def weekly_loop(log_bot, admin_id):
         await tell(log_bot, admin_id, weekly_text(reset))
 
 
+def banner(models, now):
+    """Заметная ярко-зелёная рамка «бот запущен» для консоли хостинга."""
+    line = "=" * 60
+    return (f"\033[1;92m{line}\n"
+            f"  EPSILON ЗАПУЩЕН  {fmt_msk(now)} МСК\n"
+            f"  модели: {', '.join(models)}\n"
+            f"{line}\033[0m")
+
+
 async def tell(log_bot, admin_id, text):
     """Сообщение владельцу через лог-бота; не дошло — только предупреждение в консоль."""
     try:
@@ -156,6 +165,8 @@ async def serve(poll, log_bot, admin_id, models, marker):
     await tell(log_bot, admin_id, text)
     with open(marker, "w"):
         pass
+    # через logging, а не print: print в консоль не в UTF-8 падает на кириллице и уронил бы бота
+    logging.info("\n%s", banner(models, datetime.now(timezone.utc)))
     try:
         await poll()
     except Exception as error:
