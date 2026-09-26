@@ -6,14 +6,15 @@ import itertools
 from datetime import datetime, timezone
 
 from aiogram.client.session.base import BaseSession
-from aiogram.exceptions import TelegramBadRequest
-from aiogram.methods import DeleteMessage, DeleteMessages, SendMessage
+from aiogram.exceptions import ClientDecodeError, TelegramBadRequest, TelegramRetryAfter
+from aiogram.methods import AnswerCallbackQuery, DeleteMessage, DeleteMessages, SendMessage
 from aiogram.types import Chat, Message
 
 # id с запасом по длине, чтобы "есть ли id в тексте" не совпадало случайно
 USER = 111111
 USER2 = 333333
 OTHER = 222222
+OTHER2 = 444444
 ADMIN = 999999
 START = [{"type": "bot_command", "offset": 0, "length": 6}]
 PHOTO = [{"file_id": "x", "file_unique_id": "y", "width": 1, "height": 1}]
@@ -82,12 +83,16 @@ class MockedSession(BaseSession):
     Отправленным сообщениям даёт id по порядку: 100, 101, …; пары (SendMessage, id) — в ids.
     fail=True — любой запрос падает с TelegramBadRequest; fail_delete=True — падают только
     DeleteMessage и DeleteMessages (запрос при этом всё равно запоминается).
+    decode_error=True — любой запрос падает с ClientDecodeError (кривой ответ, это не TelegramAPIError);
+    fail_send=True — всегда падает SendMessage; fail_answer=True — падает AnswerCallbackQuery;
+    retry_after=N — столько следующих SendMessage ответят TelegramRetryAfter(retry_after=0).
     """
 
     def __init__(self):
         super().__init__()
         self.requests, self.ids, self.next_id = [], [], 100
         self.fail, self.fail_delete = False, False
+        self.decode_error, self.fail_send, self.fail_answer, self.retry_after = False, False, False, 0
 
     async def make_request(self, bot, method, timeout=None):
         # отдаём управление, как настоящая сеть: параллельные задачи перемешиваются
@@ -95,9 +100,18 @@ class MockedSession(BaseSession):
         self.requests.append(method)
         if self.fail:
             raise TelegramBadRequest(method, "Bad Request: chat not found")
+        if self.decode_error:
+            raise ClientDecodeError("Failed to deserialize object", ValueError("кривой JSON"), "<html>")
         if self.fail_delete and isinstance(method, (DeleteMessage, DeleteMessages)):
             raise TelegramBadRequest(method, "Bad Request: message can't be deleted for everyone")
+        if self.fail_answer and isinstance(method, AnswerCallbackQuery):
+            raise TelegramBadRequest(method, "Bad Request: query is too old")
         if isinstance(method, SendMessage):
+            if self.retry_after:
+                self.retry_after -= 1
+                raise TelegramRetryAfter(method, "Too Many Requests: retry after 0", retry_after=0)
+            if self.fail_send:
+                raise TelegramBadRequest(method, "Bad Request: chat not found")
             self.ids.append((method, self.next_id))
             self.next_id += 1
             return Message(message_id=self.next_id - 1, date=datetime.now(timezone.utc),
@@ -113,19 +127,23 @@ class MockedSession(BaseSession):
 
 class FakeAsk:
     """Вместо ai.ask для бота: запоминает (history, question), отвечает ("ответ N", "m1"),
-    где N — номер вызова. error — бросить это исключение вместо ответа."""
+    где N — номер вызова. error — бросить это исключение вместо ответа; answer — отвечать этим текстом;
+    gate — asyncio.Event: «Gemini думает», пока тест не вызовет gate.set() (вызов в calls уже записан)."""
 
     def __init__(self):
-        self.calls, self.error = [], None
+        self.calls, self.error, self.answer, self.gate = [], None, None, None
 
     async def __call__(self, history, question):
         # копия: бот может потом менять тот же список; deepcopy сохраняет тип (list остаётся list)
         self.calls.append((copy.deepcopy(history), question))
+        number = len(self.calls)
         # отдаём управление, как настоящий запрос в сеть
         await asyncio.sleep(0)
+        if self.gate is not None:
+            await self.gate.wait()
         if self.error is not None:
             raise self.error
-        return f"ответ {len(self.calls)}", "m1"
+        return self.answer or f"ответ {number}", "m1"
 
 
 def gemini_ok(text):

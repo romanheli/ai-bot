@@ -4,10 +4,34 @@ import unittest
 import aiohttp
 
 import ai
-from testutil import FakeGemini, gemini_ok
+from testutil import FakeGemini, FakeResponse, gemini_ok
 
 KEY = "SECRET-KEY"
 URL = "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent"
+FLAG = "\U0001F1F7\U0001F1FA"  # флаг: две половинки по 2 единицы UTF-16
+
+
+class BadJson(FakeResponse):
+    """Ответ, у которого тело не JSON: json() бросает ValueError."""
+
+    async def json(self, *args, **kwargs):
+        raise ValueError("not json")
+
+
+class Gemini(FakeGemini):
+    """FakeGemini, который принимает и готовый ответ (FakeResponse) и запоминает таймауты."""
+
+    def __init__(self, routes):
+        super().__init__(routes)
+        self.timeouts = []
+
+    def post(self, url, json=None, headers=None, timeout=None):
+        self.timeouts.append(timeout)
+        answer = self.routes[url.rsplit("/", 1)[1].split(":")[0]]
+        if isinstance(answer, FakeResponse):
+            self.calls.append((url, json, headers))
+            return answer
+        return super().post(url, json, headers, timeout)
 
 
 class TgLenTest(unittest.TestCase):
@@ -55,6 +79,33 @@ class CleanTest(unittest.TestCase):
     def test_strip(self):
         self.assertEqual(ai.clean("\n  текст  \n\n"), "текст")
 
+    def test_power_and_kwargs_untouched(self):
+        for text in ("2**10", "x**2 + y**2", "**kwargs", "a**b", "f(*args, **kwargs)"):
+            with self.subTest(text=text):
+                self.assertEqual(ai.clean(text), text)
+
+    def test_only_stars_is_empty(self):
+        self.assertEqual(ai.clean("**"), "")
+        self.assertEqual(ai.clean("Текст\n***\nещё"), "Текст\n\nещё")
+
+    def test_code_block_untouched(self):
+        text = "Пример:\n```python\n# комментарий\n- a\ndef f(**kwargs):\n    return 2**10\n```\nГотово **да**"
+        self.assertEqual(ai.clean(text),
+                         "Пример:\n# комментарий\n- a\ndef f(**kwargs):\n    return 2**10\nГотово да")
+
+    def test_fence_with_indent(self):
+        self.assertEqual(ai.clean("Шаги:\n  ```\n  * x\n  ```\n* y"), "Шаги:\n  * x\n• y")
+
+    def test_unclosed_block_is_code(self):
+        self.assertEqual(ai.clean("Код:\n```\n# не заголовок\n**kwargs**"), "Код:\n# не заголовок\n**kwargs**")
+
+    def test_inline_code(self):
+        self.assertEqual(ai.clean("Вызови `print(x)` и `**kwargs`"), "Вызови print(x) и **kwargs")
+
+    def test_links(self):
+        self.assertEqual(ai.clean("Смотри [документацию](https://docs.python.org/3/) тут"),
+                         "Смотри документацию (https://docs.python.org/3/) тут")
+
 
 class FitTest(unittest.TestCase):
     def test_short_unchanged(self):
@@ -94,6 +145,36 @@ class FitTest(unittest.TestCase):
         result = ai.fit("а" * 10, limit=5)
         self.assertLessEqual(ai.tg_len(result), 5)
         self.assertTrue(result.endswith("…"))
+
+    def test_early_newline_ignored(self):
+        # перевод строки в первой половине — не режем по нему, иначе потеряем почти весь ответ
+        result = ai.fit("Заголовок\n" + "а" * 6000)
+        self.assertLessEqual(ai.tg_len(result), 4096)
+        self.assertGreater(len(result), 4000)
+        self.assertTrue(result.startswith("Заголовок\nааа"))
+
+    def test_cuts_by_exclamation_and_question(self):
+        for text, end in (("Ура! " * 1000, "!…"), ("Это вопрос? " * 400, "?…")):
+            with self.subTest(end=end):
+                result = ai.fit(text)
+                self.assertLessEqual(ai.tg_len(result), 4096)
+                self.assertTrue(result.endswith(end))
+
+    def test_cuts_by_space(self):
+        # ни переводов строки, ни точек — режем по последнему пробелу, последнее слово целое
+        result = ai.fit("слово " * 1000)
+        self.assertEqual(result, ("слово " * 682).rstrip() + "…")
+        self.assertLessEqual(ai.tg_len(result), 4096)
+
+    def test_far_space_ignored(self):
+        # пробел дальше 50 символов от конца обрезка — режем как есть
+        result = ai.fit("а" * 4000 + " " + "б" * 1000)
+        self.assertEqual(result, "а" * 4000 + " " + "б" * 94 + "…")
+
+    def test_flag_not_torn(self):
+        # на границе обрезка — половинка флага; рядом пробел — режем по нему
+        result = ai.fit("а" * 4080 + " " + FLAG * 10)
+        self.assertEqual(result, "а" * 4080 + "…")
 
 
 class BuildBodyTest(unittest.TestCase):
@@ -146,7 +227,7 @@ class AskTest(unittest.IsolatedAsyncioTestCase):
     MODELS = ["m1", "m2"]
 
     async def ask(self, routes, history=(), question="вопрос"):
-        self.gemini = FakeGemini(routes)
+        self.gemini = Gemini(routes)
         return await ai.ask(self.gemini, KEY, self.MODELS, list(history), question)
 
     async def test_first_model(self):
@@ -160,10 +241,11 @@ class AskTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.gemini.models(), ["m1", "m2"])
 
     async def test_retry_statuses_go_to_next(self):
-        for status in (404, 429, 500, 503):
+        for status in (404, 408, 429, 500, 502, 503, 504, 599):
             with self.subTest(status=status):
                 result = await self.ask({"m1": (status, {}), "m2": (200, gemini_ok("ответ"))})
                 self.assertEqual(result, ("ответ", "m2"))
+                self.assertEqual(self.gemini.models(), ["m1", "m2"])
 
     async def test_empty_goes_to_next(self):
         result = await self.ask({"m1": (200, {"candidates": []}), "m2": (200, gemini_ok("ответ"))})
@@ -178,7 +260,7 @@ class AskTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, ("ответ", "m2"))
 
     async def test_fatal_status_stops(self):
-        for status in (400, 403):
+        for status in (400, 402, 403):
             with self.subTest(status=status):
                 with self.assertRaises(ai.AIError) as err:
                     await self.ask({"m1": (status, {}), "m2": (200, gemini_ok("ответ"))})
@@ -216,6 +298,55 @@ class AskTest(unittest.IsolatedAsyncioTestCase):
         text, _ = await self.ask({"m1": (200, gemini_ok("а" * 5000))})
         self.assertLessEqual(ai.tg_len(text), ai.TG_LIMIT)
         self.assertTrue(text.endswith("…"))
+
+    async def test_google_message_in_error(self):
+        with self.assertRaises(ai.AIError) as err:
+            await self.ask({"m1": (429, {"error": {"message": "quota"}}), "m2": asyncio.TimeoutError()})
+        self.assertEqual(str(err.exception), "m1: HTTP 429 quota; m2: timeout")
+
+    async def test_odd_error_does_not_crash(self):
+        # error строкой, списком, без message, message = null, тело — список
+        for data in ({"error": "строка"}, {"error": ["x"]}, {"error": {}}, {"error": {"message": None}}, [{"error": {}}]):
+            with self.subTest(data=data):
+                result = await self.ask({"m1": (500, data), "m2": (200, gemini_ok("ответ"))})
+                self.assertEqual(result, ("ответ", "m2"))
+                with self.assertRaises(ai.AIError) as err:
+                    await self.ask({"m1": (400, data), "m2": (200, gemini_ok("ответ"))})
+                self.assertEqual(str(err.exception), "m1: HTTP 400")
+
+    async def test_blocked_stops(self):
+        data = {"promptFeedback": {"blockReason": "SAFETY"}}
+        with self.assertRaises(ai.BlockedError) as err:
+            await self.ask({"m1": (200, data), "m2": (200, gemini_ok("ответ"))})
+        self.assertEqual(str(err.exception), "m1: blocked SAFETY")
+        self.assertIsInstance(err.exception, ai.AIError)
+        self.assertEqual(self.gemini.models(), ["m1"])
+
+    async def test_blocked_with_text_answers(self):
+        data = {**gemini_ok("ответ"), "promptFeedback": {"blockReason": "SAFETY"}}
+        result = await self.ask({"m1": (200, data)})
+        self.assertEqual(result, ("ответ", "m1"))
+
+    async def test_empty_after_clean_goes_to_next(self):
+        for text in ("**", "  ", "## \n"):
+            with self.subTest(text=text):
+                result = await self.ask({"m1": (200, gemini_ok(text)), "m2": (200, gemini_ok("ответ"))})
+                self.assertEqual(result, ("ответ", "m2"))
+                with self.assertRaises(ai.AIError) as err:
+                    await self.ask({"m1": (200, gemini_ok(text)), "m2": asyncio.TimeoutError()})
+                self.assertEqual(str(err.exception), "m1: empty; m2: timeout")
+
+    async def test_not_json(self):
+        result = await self.ask({"m1": BadJson(503), "m2": (200, gemini_ok("ответ"))})
+        self.assertEqual(result, ("ответ", "m2"))
+        with self.assertRaises(ai.AIError) as err:
+            await self.ask({"m1": BadJson(200), "m2": asyncio.TimeoutError()})
+        self.assertEqual(str(err.exception), "m1: empty; m2: timeout")
+
+    async def test_timeout_30(self):
+        self.assertEqual(ai.ASK_TIMEOUT, 30)
+        await self.ask({"m1": (200, gemini_ok("ответ"))})
+        self.assertEqual(self.gemini.timeouts[0].total, 30)
 
 
 if __name__ == "__main__":
