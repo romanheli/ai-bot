@@ -281,6 +281,7 @@ def build_dispatcher(allowed, admin_id, log_bot, ask, creator_name, creator_url)
     ui_locks = {}
     tracked = {}  # id чата -> пары (id сообщения, время now()) входящих и наших, которые удалим при очистке
     menus = {}  # id чата -> id текущего сообщения меню
+    status = {}  # id чата -> id «Сессия очищена.» / «Сессия уже пуста.»: следующее «Очистить сессию» его удалит
     # упрощение: словарь растёт с каждым новым чужим id; если чужих станет очень много — чистить старые записи
     denied_at = {}  # id чужого -> когда ему последний раз ответили «Нет доступа»
     dp = Dispatcher()
@@ -344,7 +345,11 @@ def build_dispatcher(allowed, admin_id, log_bot, ask, creator_name, creator_url)
             await drop(bot, chat_id, message.message_id)
             # «пусто» — по истории: «Сессия очищена.» и меню отслеживаются всегда, по ним судить нельзя
             if not histories.get(message.from_user.id):
-                track(await send(bot, chat_id, EMPTY_TEXT))
+                if chat_id in status:
+                    await drop(bot, chat_id, status.pop(chat_id))
+                sent = track(await send(bot, chat_id, EMPTY_TEXT))
+                if sent is not None:
+                    status[chat_id] = sent.message_id
             else:
                 track(await send(bot, chat_id, CONFIRM_TEXT, reply_markup=CONFIRM_KB))
 
@@ -396,7 +401,8 @@ def build_dispatcher(allowed, admin_id, log_bot, ask, creator_name, creator_url)
             await callback.answer()
         chat_id = callback.message.chat.id
         async with ui_locks.setdefault(chat_id, asyncio.Lock()):
-            await drop(bot, chat_id, callback.message.message_id)
+            if callback.message.message_id != status.get(chat_id):  # иначе оно уже стало «Сессия очищена.»
+                await drop(bot, chat_id, callback.message.message_id)
 
     @dp.callback_query(F.data == "clear:yes")
     async def clear_yes(callback, bot):
@@ -406,17 +412,29 @@ def build_dispatcher(allowed, admin_id, log_bot, ask, creator_name, creator_url)
         # сначала дождаться текущего ответа Gemini, иначе он придёт уже в очищенный чат
         async with locks.setdefault(user.id, asyncio.Lock()):
             async with ui_locks.setdefault(chat_id, asyncio.Lock()):
+                if warning == status.get(chat_id):
+                    return  # повторное нажатие: предупреждение уже стало «Сессия очищена.»
                 if warning not in [message_id for message_id, _ in tracked.get(chat_id, [])]:
-                    # устаревшее предупреждение: повторное нажатие или кнопка из прошлого запуска
+                    # устаревшее предупреждение: кнопка из прошлого запуска
                     await drop(bot, chat_id, warning)
                     return
                 histories.pop(user.id, None)
-                # предупреждение тоже там; старше DELETE_AGE Telegram всё равно не удалит — не пробуем
-                fresh = [message_id for message_id, at in tracked.pop(chat_id, []) if now() - at < DELETE_AGE]
-                await delete(bot, chat_id, fresh)
+                # удаляем всё, кроме предупреждения; старше DELETE_AGE Telegram всё равно не удалит — не пробуем
+                pairs = tracked.pop(chat_id, [])
+                tracked[chat_id] = [pair for pair in pairs if pair[0] == warning]
+                await delete(bot, chat_id, [message_id for message_id, at in pairs
+                                            if message_id != warning and now() - at < DELETE_AGE])
                 menus.pop(chat_id, None)
-                # это сообщение держит нижние кнопки: без него на ПК они пропадут вместе со старыми сообщениями
-                track(await send(bot, chat_id, CLEARED_TEXT, reply_markup=MAIN_KB))
+                # упрощение: нижние кнопки держало удалённое сообщение — на ПК они пропадут до следующего ответа
+                try:
+                    # без reply_markup Telegram убирает кнопки Принять/Отменить
+                    await bot.edit_message_text(CLEARED_TEXT, chat_id=chat_id, message_id=warning)
+                    status[chat_id] = warning
+                except AiogramError:
+                    await drop(bot, chat_id, warning)
+                    sent = track(await send(bot, chat_id, CLEARED_TEXT, reply_markup=MAIN_KB))
+                    if sent is not None:
+                        status[chat_id] = sent.message_id
                 await show_menu(bot, chat_id)  # меню — последним
         await log(f"Очистил сессию: {who(user)}")
 

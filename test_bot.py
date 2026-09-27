@@ -9,8 +9,8 @@ from unittest.mock import patch
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramNetworkError
-from aiogram.methods import (AnswerCallbackQuery, DeleteMessage, DeleteMessages, GetMe, SendChatAction,
-                             SendMessage)
+from aiogram.methods import (AnswerCallbackQuery, DeleteMessage, DeleteMessages, EditMessageText, GetMe,
+                             SendChatAction, SendMessage)
 from aiogram.types import InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 
 import ai
@@ -446,6 +446,10 @@ class BotCase(unittest.IsolatedAsyncioTestCase):
             ids.update(m.message_ids if isinstance(m, DeleteMessages) else [m.message_id])
         return ids
 
+    def edits(self):
+        """Правки сообщений основного бота (EditMessageText) по порядку."""
+        return [m for m in self.session.requests if isinstance(m, EditMessageText)]
+
     def answered(self):
         """Бот ответил на нажатие инлайн-кнопки (AnswerCallbackQuery)."""
         return any(isinstance(m, AnswerCallbackQuery) for m in self.session.requests)
@@ -731,14 +735,19 @@ class ClearTest(BotCase):
         await self.push(callback(USER, "clear:yes", warning))
         # ответ на нажатие — первым, до удалений
         self.assertIsInstance(self.session.requests[before], AnswerCallbackQuery)
-        self.assertLessEqual({begin, menu, question, answer, warning}, self.deleted())
-        # после удалений: «Сессия очищена» с нижними кнопками, потом меню последним
+        self.assertLessEqual({begin, menu, question, answer}, self.deleted())
+        # предупреждение не удаляется, а после удалений превращается в «Сессия очищена.» без кнопок
+        self.assertNotIn(warning, self.deleted())
+        self.assertNotIn(bot.CLEARED_TEXT, [m.text for m in self.sent()])
         requests = self.session.requests
         last_delete = max(i for i, m in enumerate(requests) if isinstance(m, (DeleteMessage, DeleteMessages)))
-        cleared = [i for i, m in enumerate(requests) if isinstance(m, SendMessage) and m.text == bot.CLEARED_TEXT]
+        cleared = [i for i, m in enumerate(requests) if isinstance(m, EditMessageText)]
         self.assertEqual(len(cleared), 1)
+        edit = requests[cleared[0]]
+        self.assertEqual((edit.chat_id, edit.message_id, edit.text), (USER, warning, bot.CLEARED_TEXT))
+        self.assertIsNone(edit.reply_markup)
         self.assertLess(last_delete, cleared[0])
-        self.assertEqual(requests[cleared[0]].reply_markup, bot.MAIN_KB)
+        # меню — последним
         self.assertEqual(self.sent()[-1].text, bot.menu_text(NAME, URL))
         menus = [i for i, m in enumerate(requests) if isinstance(m, SendMessage) and m.text == self.sent()[-1].text]
         self.assertLess(cleared[0], menus[-1])
@@ -752,8 +761,28 @@ class ClearTest(BotCase):
         _, _, warning = await self.ask_and_clear()
         # исключение не должно вылететь наружу
         await self.push(callback(USER, "clear:yes", warning))
-        self.assertIn(bot.CLEARED_TEXT, [m.text for m in self.sent()])
+        self.assertEqual([(m.message_id, m.text) for m in self.edits()], [(warning, bot.CLEARED_TEXT)])
         self.assertEqual(self.sent()[-1].text, bot.menu_text(NAME, URL))
+
+    async def test_accept_edit_fails(self):
+        # не вышло отредактировать — предупреждение удаляем, «Сессия очищена.» шлём новым сообщением
+        self.session.fail_edit = True
+        _, _, warning = await self.ask_and_clear()
+        await self.push(callback(USER, "clear:yes", warning))  # исключение не должно вылететь
+        self.assertIn(warning, self.deleted())
+        texts = [m.text for m in self.sent()]
+        self.assertEqual(texts[-2:], [bot.CLEARED_TEXT, bot.menu_text(NAME, URL)])
+        # и это сообщение повторное «Очистить сессию» тоже убирает
+        await self.push(update(USER, bot.CLEAR_BUTTON))
+        self.assertIn(self.sent_ids(bot.CLEARED_TEXT)[0], self.deleted())
+        self.assertEqual(self.sent()[-1].text, bot.EMPTY_TEXT)
+
+    async def test_cancel_after_accept(self):
+        # «Отменить» под сообщением, которое уже стало «Сессия очищена.» (быстрое двойное нажатие) — не трогаем
+        _, _, warning = await self.ask_and_clear()
+        await self.push(callback(USER, "clear:yes", warning))
+        await self.push(callback(USER, "clear:no", warning))
+        self.assertNotIn(warning, self.deleted())
 
     async def test_other_user_kept(self):
         await self.push(update(USER, "Привет"))
@@ -790,10 +819,21 @@ class ClearTest(BotCase):
 
     async def test_empty_after_accept(self):
         # после «Принять» в чате есть «Сессия очищена.» и меню, но история пуста — снова «Сессия уже пуста.»
+        # «Сессия очищена.» при этом удаляется
         _, _, warning = await self.ask_and_clear()
         await self.push(callback(USER, "clear:yes", warning))
         await self.push(update(USER, bot.CLEAR_BUTTON))
+        self.assertIn(warning, self.deleted())
         self.assertEqual(self.sent()[-1].text, bot.EMPTY_TEXT)
+
+    async def test_empty_twice(self):
+        # повторное «Очистить сессию» при пустой истории — прошлое «Сессия уже пуста.» удаляется, приходит новое
+        await self.push(update(USER, bot.CLEAR_BUTTON))
+        first = self.sent_ids(bot.EMPTY_TEXT)[0]
+        await self.push(update(USER, bot.CLEAR_BUTTON))
+        self.assertIn(first, self.deleted())
+        second = self.sent_ids(bot.EMPTY_TEXT)[1]
+        self.assertNotIn(second, self.deleted())
 
     async def test_accept_waits_for_answer(self):
         # «Принять», пока Gemini думает: очистка ждёт ответа и удаляет его тоже
@@ -805,15 +845,16 @@ class ClearTest(BotCase):
         clearing = asyncio.create_task(self.push(callback(USER, "clear:yes", warning)))
         for _ in range(50):
             await asyncio.sleep(0)
-        self.assertNotIn(bot.CLEARED_TEXT, [m.text for m in self.sent()])
+        self.assertEqual(self.edits(), [])
         self.ask.gate.set()
         await asyncio.gather(asking, clearing)
         answer = self.sent_ids("ответ 2")[0]
-        self.assertLessEqual({question["message"]["message_id"], answer, warning}, self.deleted())
-        texts = [m.text for m in self.sent()]
-        self.assertEqual(texts.count(bot.CLEARED_TEXT), 1)
-        self.assertLess(texts.index("ответ 2"), texts.index(bot.CLEARED_TEXT))
-        self.assertEqual(texts[-1], bot.menu_text(NAME, URL))
+        self.assertLessEqual({question["message"]["message_id"], answer}, self.deleted())
+        requests = self.session.requests
+        answered_at = next(i for i, m in enumerate(requests) if isinstance(m, SendMessage) and m.text == "ответ 2")
+        [edited_at] = [i for i, m in enumerate(requests) if isinstance(m, EditMessageText)]
+        self.assertLess(answered_at, edited_at)
+        self.assertEqual(self.sent()[-1].text, bot.menu_text(NAME, URL))
         # история очищена уже после ответа
         await self.push(update(USER, "Заново"))
         self.assertEqual(self.ask.calls[-1], ([], "Заново"))
@@ -824,8 +865,9 @@ class ClearTest(BotCase):
         await asyncio.gather(self.push(callback(USER, "clear:yes", warning)),
                              self.push(callback(USER, "clear:yes", warning)))
         new = self.session.requests[before:]
-        self.assertEqual([m.text for m in new if isinstance(m, SendMessage)],
-                         [bot.CLEARED_TEXT, bot.menu_text(NAME, URL)])
+        self.assertEqual([m.text for m in new if isinstance(m, SendMessage)], [bot.menu_text(NAME, URL)])
+        self.assertEqual([m.text for m in new if isinstance(m, EditMessageText)], [bot.CLEARED_TEXT])
+        self.assertNotIn(warning, self.deleted())
         self.assertEqual(sum(isinstance(m, AnswerCallbackQuery) for m in new), 2)
         self.assertEqual(sum("Очистил" in text for text in self.logs()[logged:]), 1)
 
@@ -846,8 +888,7 @@ class ClearTest(BotCase):
         _, _, warning = await self.ask_and_clear()
         await self.push(callback(USER, "clear:yes", warning))  # исключение не должно вылететь
         self.assertTrue(self.answered())
-        self.assertIn(warning, self.deleted())
-        self.assertIn(bot.CLEARED_TEXT, [m.text for m in self.sent()])
+        self.assertEqual([(m.message_id, m.text) for m in self.edits()], [(warning, bot.CLEARED_TEXT)])
         self.assertEqual(self.sent()[-1].text, bot.menu_text(NAME, URL))
 
     async def test_cancel_answer_fails(self):
@@ -878,21 +919,22 @@ class ClearTest(BotCase):
         # старше 47 ч — не удаляем (Telegram всё равно не даст), моложе — удаляем
         self.assertNotIn(old["message"]["message_id"], deleted)
         self.assertNotIn(self.sent_ids("ответ 1")[0], deleted)
-        self.assertLessEqual({new["message"]["message_id"], self.sent_ids("ответ 2")[0], warning}, deleted)
+        self.assertLessEqual({new["message"]["message_id"], self.sent_ids("ответ 2")[0]}, deleted)
+        self.assertNotIn(warning, deleted)
 
     async def many(self):
-        """/start, 74 вопроса, «Очистить сессию», «Принять»: 150 отслеженных id.
+        """/start, 75 вопросов, «Очистить сессию», «Принять»: 152 отслеженных id, удаляются все, кроме предупреждения.
         Возвращает (ожидаемые id, запросы, сделанные после нажатия «Принять»)."""
         begin = start(USER)
         await self.push(begin)
-        questions = [update(USER, f"вопрос {i}") for i in range(74)]
+        questions = [update(USER, f"вопрос {i}") for i in range(75)]
         for question in questions:
             await self.push(question)
         await self.push(update(USER, bot.CLEAR_BUTTON))
         warning = self.sent_ids(bot.CONFIRM_TEXT)[0]
-        expected = ({begin["message"]["message_id"], warning} | {q["message"]["message_id"] for q in questions}
+        expected = ({begin["message"]["message_id"]} | {q["message"]["message_id"] for q in questions}
                     | {i for m, i in self.session.ids if m.text.startswith("ответ ")})
-        self.assertEqual(len(expected), 150)
+        self.assertEqual(len(expected), 151)
         before = len(self.session.requests)
         await self.push(callback(USER, "clear:yes", warning))
         return expected, self.session.requests[before:]
@@ -900,7 +942,7 @@ class ClearTest(BotCase):
     async def test_accept_batches(self):
         expected, new = await self.many()
         batches = [m.message_ids for m in new if isinstance(m, DeleteMessages)]
-        self.assertEqual([len(b) for b in batches], [100, 50])
+        self.assertEqual([len(b) for b in batches], [100, 51])
         self.assertEqual(set(batches[0]) | set(batches[1]), expected)
         self.assertFalse(any(isinstance(m, DeleteMessage) for m in new))
 

@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 
 from aiogram.client.session.base import BaseSession
 from aiogram.exceptions import ClientDecodeError, TelegramBadRequest, TelegramRetryAfter
-from aiogram.methods import AnswerCallbackQuery, DeleteMessage, DeleteMessages, SendMessage
+from aiogram.methods import AnswerCallbackQuery, DeleteMessage, DeleteMessages, EditMessageText, SendMessage
 from aiogram.types import Chat, Message
 
 # id с запасом по длине, чтобы "есть ли id в тексте" не совпадало случайно
@@ -85,6 +85,7 @@ class MockedSession(BaseSession):
     DeleteMessage и DeleteMessages (запрос при этом всё равно запоминается).
     decode_error=True — любой запрос падает с ClientDecodeError (кривой ответ, это не TelegramAPIError);
     fail_send=True — всегда падает SendMessage; fail_answer=True — падает AnswerCallbackQuery;
+    fail_edit=True — падает EditMessageText;
     retry_after=N — столько следующих SendMessage ответят TelegramRetryAfter(retry_after=0).
     """
 
@@ -93,6 +94,7 @@ class MockedSession(BaseSession):
         self.requests, self.ids, self.next_id = [], [], 100
         self.fail, self.fail_delete = False, False
         self.decode_error, self.fail_send, self.fail_answer, self.retry_after = False, False, False, 0
+        self.fail_edit = False
 
     async def make_request(self, bot, method, timeout=None):
         # отдаём управление, как настоящая сеть: параллельные задачи перемешиваются
@@ -106,6 +108,8 @@ class MockedSession(BaseSession):
             raise TelegramBadRequest(method, "Bad Request: message can't be deleted for everyone")
         if self.fail_answer and isinstance(method, AnswerCallbackQuery):
             raise TelegramBadRequest(method, "Bad Request: query is too old")
+        if self.fail_edit and isinstance(method, EditMessageText):
+            raise TelegramBadRequest(method, "Bad Request: message to edit not found")
         if isinstance(method, SendMessage):
             if self.retry_after:
                 self.retry_after -= 1
