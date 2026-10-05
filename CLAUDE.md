@@ -50,11 +50,11 @@ CREATOR_USERNAME — username создателя, ссылка https://t.me/<use
 
 ## Деплой
 - Wispbyte, сервер, где раньше была Gamma (Gamma выключена с 2026-09-27, вернуть — только по команде пользователя).
-  Код берётся из публичного https://github.com/romanheli/ai-bot (без логина/токена), App py file = bot.py,
+  Код берётся из приватного https://github.com/wgtujtut-4/ai-bot (в Wispbyte — Git Username + токен GitHub только на чтение), App py file = bot.py,
   Auto Update = 1: после пуша пользователь жмёт Restart. Переменные — страница Environment (пишет .env на сервере).
 - Startup Command: перед `/usr/local/bin/python` должен стоять `exec` — иначе хостинг не пробрасывает сигнал
   Stop боту (питон запускается дочерним процессом), и хостинг просто убивает процесс: в лог не придёт
   «Бот остановлен», а при следующем запуске придёт «Прошлый запуск оборвался». С `exec` сигнал доходит до бота.
-- Пушить в оба репозитория: `git push romanheli main` и `git push origin main` (приватная копия wgtujtut-4/ai-bot;
-  в адресе origin прописан `wgtujtut-4@`, иначе Git Credential Manager подставляет аккаунт romanheli).
+- Пушить только в origin (wgtujtut-4/ai-bot): `git push origin main`. Публичный romanheli/ai-bot больше не используется (с 2026-10-05).
+  В адресе origin прописан `wgtujtut-4@`, иначе Git Credential Manager подставляет аккаунт romanheli.
 - Сервер на Python 3.11: в f-строках не повторять внешние кавычки внутри {} и не ставить там обратный слеш.
