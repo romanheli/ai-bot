@@ -181,6 +181,7 @@ class BuildBodyTest(unittest.TestCase):
     def test_prompt_name_and_style(self):
         self.assertIn("Epsilon", ai.SYSTEM_PROMPT)
         self.assertIn("на «вы»", ai.SYSTEM_PROMPT)
+        self.assertIn("Никогда не здоровайся", ai.SYSTEM_PROMPT)
 
     def test_with_history(self):
         body = ai.build_body([("q1", "a1"), ("q2", "a2")], "q3")
